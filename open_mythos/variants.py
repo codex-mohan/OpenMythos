@@ -1,20 +1,58 @@
 from open_mythos.main import MythosConfig
 
 # Parameter budget breakdown per variant:
-#   total ≈ embed + prelude/coda dense blocks + recurrent MLA + MoE
-#   MoE   = 3 * dim * expert_dim * (n_experts + n_shared * n_experts_per_tok)
-# expert_dim is solved from the residual budget after all other terms.
+#   total ≈ embed + prelude/coda dense blocks + recurrent MLA attention × recurrent_layers + shared MoE
+#   Effective depth = recurrent_layers × max_loop_iters
+#   MoE is shared across all recurrent layers — each layer contributes its own attention weights (MLA)
+#   and routes to different experts within the same shared pool due to varying hidden states.
+
+
+def mythos_200m() -> MythosConfig:
+    """200M parameter config. dim=1024, 8 rec layers × 4 loops = 32 effective depth, 30 experts, 4k context.
+
+    Budget breakdown (~203M total):
+        embed + tied head : ~33M
+        prelude (4 blocks) : ~21M   (dense MLA + SwiGLU FFN)
+        coda   (4 blocks)  : ~21M   (dense MLA + SwiGLU FFN)
+        recurrent (8 layers): ~128M (shared MoE: 30 routed + 2 shared experts, 8×MLA attention)
+    Comparable to GPT-2 Small (124M dense) but with 32 effective depth and MoE breadth.
+    """
+    return MythosConfig(
+        vocab_size=32000,
+        dim=1024,
+        n_heads=8,
+        n_kv_heads=2,
+        max_seq_len=4096,
+        recurrent_layers=8,
+        max_loop_iters=4,
+        prelude_layers=4,
+        coda_layers=4,
+        attn_type="mla",
+        kv_lora_rank=128,
+        q_lora_rank=256,
+        qk_rope_head_dim=32,
+        qk_nope_head_dim=48,
+        v_head_dim=48,
+        n_experts=30,
+        n_shared_experts=2,
+        n_experts_per_tok=4,
+        expert_dim=1024,
+        act_threshold=0.99,
+        rope_theta=500000.0,
+        lora_rank=8,
+    )
 
 
 def mythos_1b() -> MythosConfig:
-    """1B parameter config. Small research/fine-tuning model. dim=2048, 64 experts, 16 loop iters, 4k context."""
+    """1B parameter config. dim=2048, 8 rec layers × 2 loops = 16 effective depth, 64 experts, 4k context."""
     return MythosConfig(
         vocab_size=32000,
         dim=2048,
         n_heads=16,
         n_kv_heads=4,
         max_seq_len=4096,
-        max_loop_iters=16,
+        recurrent_layers=8,
+        max_loop_iters=2,
         prelude_layers=2,
         coda_layers=2,
         attn_type="mla",
@@ -34,14 +72,15 @@ def mythos_1b() -> MythosConfig:
 
 
 def mythos_3b() -> MythosConfig:
-    """3B parameter config. Compact inference model. dim=3072, 64 experts, 16 loop iters, 4k context."""
+    """3B parameter config. dim=3072, 12 rec layers × 3 loops = 36 effective depth, 64 experts, 4k context."""
     return MythosConfig(
         vocab_size=32000,
         dim=3072,
         n_heads=24,
         n_kv_heads=6,
         max_seq_len=4096,
-        max_loop_iters=16,
+        recurrent_layers=12,
+        max_loop_iters=3,
         prelude_layers=2,
         coda_layers=2,
         attn_type="mla",
@@ -61,14 +100,15 @@ def mythos_3b() -> MythosConfig:
 
 
 def mythos_10b() -> MythosConfig:
-    """10B parameter config. Mid-scale general model. dim=4096, 128 experts, 24 loop iters, 8k context."""
+    """10B parameter config. dim=4096, 16 rec layers × 4 loops = 64 effective depth, 128 experts, 8k context."""
     return MythosConfig(
         vocab_size=32000,
         dim=4096,
         n_heads=32,
         n_kv_heads=8,
         max_seq_len=8192,
-        max_loop_iters=24,
+        recurrent_layers=16,
+        max_loop_iters=4,
         prelude_layers=2,
         coda_layers=2,
         attn_type="mla",
@@ -88,14 +128,15 @@ def mythos_10b() -> MythosConfig:
 
 
 def mythos_50b() -> MythosConfig:
-    """50B parameter config. Large reasoning model. dim=6144, 256 experts, 32 loop iters, 8k context."""
+    """50B parameter config. dim=6144, 20 rec layers × 4 loops = 80 effective depth, 256 experts, 8k context."""
     return MythosConfig(
         vocab_size=32000,
         dim=6144,
         n_heads=48,
         n_kv_heads=8,
         max_seq_len=8192,
-        max_loop_iters=32,
+        recurrent_layers=20,
+        max_loop_iters=4,
         prelude_layers=3,
         coda_layers=3,
         attn_type="mla",
@@ -115,14 +156,15 @@ def mythos_50b() -> MythosConfig:
 
 
 def mythos_100b() -> MythosConfig:
-    """100B parameter config. Frontier-class model. dim=8192, 256 experts, 32 loop iters, 1M context, 128k output."""
+    """100B parameter config. dim=8192, 24 rec layers × 4 loops = 96 effective depth, 256 experts, 1M context."""
     return MythosConfig(
         vocab_size=32000,
         dim=8192,
         n_heads=64,
         n_kv_heads=8,
         max_seq_len=1000000,
-        max_loop_iters=32,
+        recurrent_layers=24,
+        max_loop_iters=4,
         prelude_layers=4,
         coda_layers=4,
         attn_type="mla",
@@ -143,14 +185,15 @@ def mythos_100b() -> MythosConfig:
 
 
 def mythos_500b() -> MythosConfig:
-    """500B parameter config. Ultra-scale MoE model. dim=12288, 512 experts, 48 loop iters, 1M context, 128k output."""
+    """500B parameter config. dim=12288, 32 rec layers × 5 loops = 160 effective depth, 512 experts, 1M context."""
     return MythosConfig(
         vocab_size=100000,
         dim=12288,
         n_heads=96,
         n_kv_heads=16,
         max_seq_len=1000000,
-        max_loop_iters=48,
+        recurrent_layers=32,
+        max_loop_iters=5,
         prelude_layers=4,
         coda_layers=4,
         attn_type="mla",
@@ -171,14 +214,15 @@ def mythos_500b() -> MythosConfig:
 
 
 def mythos_1t() -> MythosConfig:
-    """1T parameter config. Maximum scale. dim=16384, 512 experts, 64 loop iters, 1M context, 128k output."""
+    """1T parameter config. dim=16384, 40 rec layers × 6 loops = 240 effective depth, 512 experts, 1M context."""
     return MythosConfig(
         vocab_size=100000,
         dim=16384,
         n_heads=128,
         n_kv_heads=16,
         max_seq_len=1000000,
-        max_loop_iters=64,
+        recurrent_layers=40,
+        max_loop_iters=6,
         prelude_layers=6,
         coda_layers=6,
         attn_type="mla",

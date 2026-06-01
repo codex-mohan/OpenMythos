@@ -30,7 +30,7 @@ from contextlib import nullcontext
 from datasets import load_dataset
 
 from open_mythos import OpenMythos
-from open_mythos.main import TransformerBlock, RecurrentBlock
+from open_mythos.main import RecurrentBlock
 from open_mythos.variants import mythos_3b
 from open_mythos.tokenizer import MythosTokenizer
 
@@ -366,7 +366,7 @@ def main():
     vocab_size = encoding.vocab_size
 
     if master:
-        logger.info(f"Tokenizer: gpt-oss-20b  |  Vocab size: {vocab_size:,}")
+        logger.info(f"Tokenizer: {encoding.model_id}  |  Vocab size: {vocab_size:,}")
 
     # ------------------------------------------------------------------
     # Hyperparameters
@@ -392,10 +392,9 @@ def main():
         )
 
     # ------------------------------------------------------------------
-    # Model
+    # Model — vocab_size automatically derived from tokenizer
     # ------------------------------------------------------------------
-    cfg = mythos_3b()
-    cfg.vocab_size = vocab_size
+    cfg = mythos_3b().with_vocab(vocab_size)
     cfg.max_seq_len = seq_len
 
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -409,7 +408,7 @@ def main():
             reduce_dtype=amp_dtype,
             buffer_dtype=amp_dtype,
         )
-        wrap_policy = ModuleWrapPolicy({TransformerBlock, RecurrentBlock})
+        wrap_policy = ModuleWrapPolicy({RecurrentBlock})
         model = FSDP(
             model,
             sharding_strategy=ShardingStrategy.FULL_SHARD,

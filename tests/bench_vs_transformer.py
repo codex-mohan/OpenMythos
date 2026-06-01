@@ -246,6 +246,7 @@ def small_cfg() -> MythosConfig:
         n_heads=8,
         n_kv_heads=2,
         max_seq_len=1024,
+        recurrent_layers=2,
         max_loop_iters=4,
         prelude_layers=1,
         coda_layers=1,
@@ -354,14 +355,14 @@ def main() -> None:
     print(
         f"  dim={cfg.dim}  n_heads={cfg.n_heads}  n_kv_heads={cfg.n_kv_heads}  "
         f"prelude={cfg.prelude_layers}  coda={cfg.coda_layers}  "
-        f"max_loop_iters={cfg.max_loop_iters}\n"
+        f"rec_layers={cfg.recurrent_layers}  max_loop_iters={cfg.max_loop_iters}\n"
         f"  experts={cfg.n_experts}  shared={cfg.n_shared_experts}  "
         f"top_k={cfg.n_experts_per_tok}  expert_dim={cfg.expert_dim}"
     )
 
-    # Build models. Baseline depth = prelude + 1 (one unique recurrent block) + coda
+    # Build models. Baseline depth = prelude + recurrent_layers + coda
     # to match the unique-parameter depth of OpenMythos (parameter-matched baseline).
-    baseline_n_layers = cfg.prelude_layers + 1 + cfg.coda_layers
+    baseline_n_layers = cfg.prelude_layers + cfg.recurrent_layers + cfg.coda_layers
 
     torch.manual_seed(0)
     mythos = OpenMythos(cfg).to(device=device, dtype=dtype).eval()
@@ -387,8 +388,8 @@ def main() -> None:
     )
     print(
         f"  Baseline unique layers = {baseline_n_layers}  "
-        f"(Mythos total runtime depth at max_loops = "
-        f"{cfg.prelude_layers + cfg.max_loop_iters + cfg.coda_layers})"
+        f"(Mythos effective depth at max_loops = "
+        f"{cfg.prelude_layers + cfg.recurrent_layers * cfg.max_loop_iters + cfg.coda_layers})"
     )
 
     # ---- Prefill ----

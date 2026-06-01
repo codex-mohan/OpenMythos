@@ -281,6 +281,7 @@ def build_tiny_cfg(vocab_size: int, seq_len: int) -> MythosConfig:
         n_heads=4,
         n_kv_heads=2,
         max_seq_len=seq_len,
+        recurrent_layers=2,
         max_loop_iters=4,
         prelude_layers=1,
         coda_layers=1,
@@ -423,8 +424,8 @@ def main() -> None:
     torch.manual_seed(args.seed)
     mythos = OpenMythos(cfg).to(device)
 
-    # Parameter-matched depth: prelude + one unique recurrent block + coda.
-    baseline_layers = cfg.prelude_layers + 1 + cfg.coda_layers
+    # Parameter-matched depth: prelude + recurrent layers + coda.
+    baseline_layers = cfg.prelude_layers + cfg.recurrent_layers + cfg.coda_layers
     torch.manual_seed(args.seed)
     baseline = BaselineTransformer(cfg, n_layers=baseline_layers).to(device)
 
@@ -435,9 +436,9 @@ def main() -> None:
         f"[{baseline_layers} layers]"
     )
     print(
-        f"[setup] Mythos runtime depth = prelude({cfg.prelude_layers}) + "
-        f"loops({cfg.max_loop_iters}) + coda({cfg.coda_layers}) = "
-        f"{cfg.prelude_layers + cfg.max_loop_iters + cfg.coda_layers}"
+        f"[setup] Mythos effective depth = prelude({cfg.prelude_layers}) + "
+        f"rec_layers({cfg.recurrent_layers}) × loops({cfg.max_loop_iters}) + coda({cfg.coda_layers}) = "
+        f"{cfg.prelude_layers + cfg.recurrent_layers * cfg.max_loop_iters + cfg.coda_layers}"
     )
 
     opt_m = torch.optim.AdamW(

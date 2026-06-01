@@ -19,14 +19,18 @@ class MythosConfig:
     Hyperparameter configuration for OpenMythos.
 
     Core:
-        vocab_size      -- token vocabulary size
-        dim             -- model hidden dimension
-        n_heads         -- number of query attention heads
-        n_kv_heads      -- number of key/value heads (GQA; ignored by MLA)
-        max_seq_len     -- maximum sequence length for RoPE precomputation
-        max_loop_iters  -- default recurrent loop depth T at inference
-        prelude_layers  -- number of standard transformer layers before the loop
-        coda_layers     -- number of standard transformer layers after the loop
+        vocab_size        -- token vocabulary size; MUST match your tokenizer.
+                             Default 32000 is a fallback — always override with
+                             tokenizer.vocab_size before building the model.
+                             gpt-oss-20b → 200064, Qwen3 → 151936, Llama3 → 128256
+        dim               -- model hidden dimension
+        n_heads           -- number of query attention heads
+        n_kv_heads        -- number of key/value heads (GQA; ignored by MLA)
+        max_seq_len       -- maximum sequence length for RoPE precomputation
+        recurrent_layers  -- number of distinct transformer blocks in the recurrent stack
+        max_loop_iters    -- times the full stack is looped; effective depth = recurrent_layers × max_loop_iters
+        prelude_layers    -- number of standard transformer layers before the loop
+        coda_layers       -- number of standard transformer layers after the loop
 
     Attention (attn_type selects between the two):
         attn_type       -- "gqa" for Grouped Query Attention, "mla" for Multi-Latent Attention
@@ -53,7 +57,8 @@ class MythosConfig:
     n_heads: int = 16
     n_kv_heads: int = 4  # GQA: fewer KV heads than Q heads
     max_seq_len: int = 4096
-    max_loop_iters: int = 16  # T — recurrent depth at inference
+    recurrent_layers: int = 8  # distinct transformer blocks composing the recurrent stack
+    max_loop_iters: int = 4  # T — times the full stack is looped; effective depth = recurrent_layers × T
     prelude_layers: int = 2
     coda_layers: int = 2
     # Attention type: "gqa" | "mla"
@@ -73,12 +78,34 @@ class MythosConfig:
     act_threshold: float = 0.99
     # RoPE
     rope_theta: float = 500000.0
-    # LoRA depth adaptation
+    # LoRA depth adaptation (deprecated — kept for config compat; RecurrentBlock no longer uses it)
     lora_rank: int = 16
     # Maximum tokens to generate per forward pass
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # ACT halting toggle — disable during pretraining (model hasn't learned to halt yet).
+    # Enable during RL fine-tuning when per-task difficulty signal is available.
+    use_act: bool = False
+
+    def with_vocab(self, vocab_size: int | str) -> "MythosConfig":
+        """
+        Return a copy of this config with vocab_size set.
+
+        If a string is passed it is treated as a HuggingFace model_id and the
+        vocabulary size is looked up (cheap — only downloads tokenizer files,
+        no model weights).  If an integer is passed it is used directly.
+
+        Usage:
+            cfg = mythos_3b().with_vocab("Qwen/Qwen3-0.5B")
+        """
+        from dataclasses import replace
+
+        if isinstance(vocab_size, str):
+            from open_mythos.tokenizer import get_vocab_size
+
+            vocab_size = get_vocab_size(vocab_size)
+        return replace(self, vocab_size=vocab_size)
 
 
 # ---------------------------------------------------------------------------
@@ -637,17 +664,24 @@ class TransformerBlock(nn.Module):
         False → Expert  (dense SwiGLU FFN; used in Prelude and Coda)
     """
 
-    def __init__(self, cfg: MythosConfig, use_moe: bool = False):
+    def __init__(self, cfg: MythosConfig, use_moe: bool = False, shared_ffn: Optional[nn.Module] = None):
         """
         Args:
-            cfg     -- MythosConfig; attn_type selects the attention class
-            use_moe -- if True, use MoEFFN; otherwise use a dense Expert FFN
+            cfg        -- MythosConfig; attn_type selects the attention class
+            use_moe    -- if True, use MoEFFN; otherwise use a dense Expert FFN
+            shared_ffn -- if provided, use this FFN module instead of creating one;
+                          enables multiple TransformerBlocks to share a single MoE
         """
         super().__init__()
         self.attn_norm = RMSNorm(cfg.dim)
         self.ffn_norm = RMSNorm(cfg.dim)
         self.attn = MLAttention(cfg) if cfg.attn_type == "mla" else GQAttention(cfg)
-        self.ffn = MoEFFN(cfg) if use_moe else Expert(cfg.dim, cfg.dim * 4 // 3)
+        if shared_ffn is not None:
+            self.ffn = shared_ffn
+        elif use_moe:
+            self.ffn = MoEFFN(cfg)
+        else:
+            self.ffn = Expert(cfg.dim, cfg.dim * 4 // 3)
         self.resid_drop = nn.Dropout(cfg.dropout)
 
     def forward(
@@ -787,36 +821,45 @@ class ACTHalting(nn.Module):
 
 class RecurrentBlock(nn.Module):
     """
-    The core recurrent block of OpenMythos — a single TransformerBlock looped T times.
+    The core recurrent block of OpenMythos — a stack of TransformerBlocks looped T times.
 
-    At each loop iteration t, the hidden state h is updated via:
-        1. loop_index_embedding: inject sinusoidal loop-index signal into h
-        2. TransformerBlock:     compute attention + MoE FFN on normalized (h + e)
-        3. LoRAAdapter:          apply depth-wise LoRA delta to transformer output
-        4. LTIInjection:         stable update h = A·h + B·e + transformer_out
-        5. ACTHalting:           accumulate per-position halting probabilities;
-                                  positions that have converged stop contributing
+    recurrent_layers distinct transformer blocks compose the recurrent stack. The full
+    stack is looped max_loop_iters times, giving effective depth = recurrent_layers ×
+    max_loop_iters.
 
-    The encoded input e (output of the Prelude) is injected at every step to keep
-    the original input signal alive across arbitrary loop depth, preventing drift.
-    The ACT mechanism produces a weighted sum of hidden states across iterations,
-    where the weights reflect when each position converged.
+    Each layer has its own attention weights (MLA or GQA) and all layers share a single
+    MoEFFN.  Different layers route to different experts because the hidden state feeding
+    the router differs at each layer.
 
-    More loop iterations at inference = deeper reasoning chains, following the
-    depth-extrapolation property of looped transformers (Saunshi et al., 2025).
+    The loop-index embedding is injected **per layer** (not once per outer loop).  This
+    gives every layer a fresh, undiluted signal of which outer iteration it is on,
+    regardless of how many residual updates have accumulated.  With per-layer injection
+    the LoRAAdapter becomes redundant and is removed — layers directly see the loop
+    identity rather than needing a separate depth-wise adapter to infer it.
+
+    Per outer-loop iteration t:
+        1. For each layer: inject loop-index + frozen e, then attention + shared MoE FFN
+        2. LTIInjection: stable update h = A·h + B·e + stack_output
+        3. ACTHalting: accumulate per-position halting probabilities;
+           positions that have converged stop contributing
     """
 
     def __init__(self, cfg: MythosConfig):
         """
         Args:
-            cfg -- MythosConfig; uses dim, lora_rank, max_loop_iters, act_threshold
+            cfg -- MythosConfig; uses dim, recurrent_layers, max_loop_iters, act_threshold
         """
         super().__init__()
         self.cfg = cfg
-        self.block = TransformerBlock(cfg, use_moe=True)
+        self.shared_moe = MoEFFN(cfg)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(cfg, use_moe=True, shared_ffn=self.shared_moe)
+                for _ in range(cfg.recurrent_layers)
+            ]
+        )
         self.injection = LTIInjection(cfg.dim)
         self.act = ACTHalting(cfg.dim)
-        self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
         self.norm = RMSNorm(cfg.dim)
         self.loop_dim = (
             cfg.dim // 8
@@ -832,63 +875,58 @@ class RecurrentBlock(nn.Module):
         kv_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         """
-        Run the recurrent loop for up to n_loops iterations with ACT early exit.
+        Run the recurrent stack for up to n_loops iterations with ACT early exit.
 
         Args:
             h        -- initial hidden state from the Prelude, shape (B, T, dim)
             e        -- encoded input frozen for injection each step, shape (B, T, dim)
             freqs_cis-- precomputed RoPE frequencies
             mask     -- additive causal mask or None
-            n_loops  -- number of loop iterations; defaults to cfg.max_loop_iters.
+            n_loops  -- number of outer-loop iterations; defaults to cfg.max_loop_iters.
                         Can be increased at inference for deeper reasoning (depth extrapolation).
-            kv_cache -- cache dict passed through to the inner TransformerBlock;
-                        each loop iteration uses a separate cache key
+            kv_cache -- cache dict passed through to each inner TransformerBlock;
+                        each (loop, layer) pair uses a separate cache key
 
         Returns:
             ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
         """
         n_loops = n_loops or self.cfg.max_loop_iters
-        B, T, D = h.shape
+        B, T_len, D = h.shape
 
-        halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
-        cumulative_p = torch.zeros(B, T, device=h.device)
-        h_out = torch.zeros_like(h)
+        halted = torch.zeros(B, T_len, device=h.device, dtype=torch.bool)
+        cumulative_p = torch.zeros(B, T_len, device=h.device)
+        h_out = torch.zeros_like(h) if self.cfg.use_act else h
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
-            combined = self.norm(h_loop + e)
-            cache_key = f"recurrent_loop_{t}"
-            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
-            trans_out = trans_out + self.lora(trans_out, t)
-            h = self.injection(h, e, trans_out)
+            block_out = h
+            for i, block in enumerate(self.blocks):
+                block_out = loop_index_embedding(block_out, t, self.loop_dim)
+                block_out = self.norm(block_out + e)
+                cache_key = f"recurrent_loop_{t}_layer_{i}"
+                block_out = block(block_out, freqs_cis, mask, kv_cache, cache_key)
 
-            p = self.act(h)  # (B, T)
-            still_running = ~halted
+            h = self.injection(h, e, block_out)
 
-            # ACT remainder trick: once cumulative_p + p crosses threshold,
-            # assign the remaining probability mass as the final weight.
-            # Gate by still_running so halted positions contribute exactly
-            # once (on the halting step) and zero thereafter — otherwise
-            # threshold<1 leaves a non-zero remainder that leaks every step.
-            remainder = (1.0 - cumulative_p).clamp(min=0)
-            weight = torch.where(
-                cumulative_p + p >= self.cfg.act_threshold,
-                remainder,
-                p,
-            )
-            weight = weight * still_running.float()
-            h_out = h_out + weight.unsqueeze(-1) * h
+            if self.cfg.use_act:
+                p = self.act(h)  # (B, T)
+                still_running = ~halted
 
-            cumulative_p = cumulative_p + p * still_running.float()
-            halted = halted | (cumulative_p >= self.cfg.act_threshold)
+                remainder = (1.0 - cumulative_p).clamp(min=0)
+                weight = torch.where(
+                    cumulative_p + p >= self.cfg.act_threshold,
+                    remainder,
+                    p,
+                )
+                weight = weight * still_running.float()
+                h_out = h_out + weight.unsqueeze(-1) * h
 
-            # Only short-circuit when there is no KV cache to keep consistent.
-            # With a cache, every loop depth must run on every forward pass so
-            # later decode steps find populated keys at every cache_key.
-            if halted.all() and kv_cache is None:
-                break
+                cumulative_p = cumulative_p + p * still_running.float()
+                halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
-        return h_out
+                if halted.all() and kv_cache is None:
+                    break
+
+        return h if not self.cfg.use_act else h_out
 
 
 # ---------------------------------------------------------------------------

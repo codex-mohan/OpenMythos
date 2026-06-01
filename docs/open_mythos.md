@@ -16,8 +16,8 @@ Input token IDs  (B, T)
         ↓
    [Prelude]            prelude_layers × standard TransformerBlock  (run once)
         ↓
-   [Recurrent Block]    one TransformerBlock looped T times
-        ↑___________↓   h_{t+1} = A·h_t + B·e + Transformer(h_t, e)
+   [Recurrent Block]    recurrent_layers × TransformerBlock  (looped T times)
+        ↑___________↓   h_{t+1} = A·h_t + B·e + stack(h_t, e)
         ↓
    [Coda]               coda_layers × standard TransformerBlock  (run once)
         ↓
@@ -43,12 +43,13 @@ All hyperparameters for the model are stored in this single frozen-style datacla
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `vocab_size` | `int` | `32000` | Token vocabulary size; sets the embedding and LM head dimension |
+| `vocab_size` | `int` | `32000` | Token vocabulary size. **Must match your tokenizer.** Use `cfg.with_vocab(model_id)` to derive it automatically from any HuggingFace tokenizer, or set it manually. |
 | `dim` | `int` | `2048` | Model hidden dimension — the width of the residual stream throughout |
 | `n_heads` | `int` | `16` | Number of query attention heads |
 | `n_kv_heads` | `int` | `4` | Number of key/value heads (GQA only); `n_heads // n_kv_heads` Q heads share each KV pair |
 | `max_seq_len` | `int` | `4096` | Maximum sequence length; RoPE frequencies are precomputed up to this length |
-| `max_loop_iters` | `int` | `16` | Default recurrent loop depth T at inference. Can be overridden per call |
+| `recurrent_layers` | `int` | `8` | Number of distinct `TransformerBlock` modules composing the recurrent stack. Each has its own attention weights but shares a single MoE. |
+| `max_loop_iters` | `int` | `4` | Times the full recurrent stack is looped. Effective depth = `recurrent_layers × max_loop_iters`. Can be overridden per call. |
 | `prelude_layers` | `int` | `2` | Number of standard transformer blocks run once before the recurrent loop |
 | `coda_layers` | `int` | `2` | Number of standard transformer blocks run once after the recurrent loop |
 
@@ -103,7 +104,7 @@ Builds all sub-modules, precomputes RoPE frequency buffers, and runs weight init
 1. `nn.Embedding(vocab_size, dim)` — token embedding table, weight-tied with the LM head.
 2. RoPE buffers — `freqs_cis` (for GQA, dim = `dim // n_heads`) and `freqs_cis_mla` (for MLA, dim = `qk_rope_head_dim`) are precomputed once and registered as non-parameter buffers. The correct buffer is selected at forward time based on `cfg.attn_type`.
 3. `prelude` — `nn.ModuleList` of `prelude_layers` `TransformerBlock` instances with dense SwiGLU FFN.
-4. `recurrent` — a single `RecurrentBlock` containing one `TransformerBlock` (with MoE FFN), `LTIInjection`, `ACTHalting`, and `LoRAAdapter`.
+4. `recurrent` — a single `RecurrentBlock` containing `recurrent_layers` `TransformerBlock`s (all sharing one MoE FFN), `LTIInjection`, `ACTHalting`, and `LoRAAdapter`.
 5. `coda` — `nn.ModuleList` of `coda_layers` `TransformerBlock` instances with dense SwiGLU FFN.
 6. `RMSNorm(dim)` applied before the LM head.
 7. `nn.Linear(dim, vocab_size, bias=False)` LM head with weights tied to the embedding.
@@ -119,12 +120,28 @@ cfg = MythosConfig(
     dim=2048,
     n_heads=16,
     n_kv_heads=4,
-    max_loop_iters=16,
+    recurrent_layers=8,
+    max_loop_iters=4,
     attn_type="mla",
 )
 model = OpenMythos(cfg)
 print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 ```
+
+### `with_vocab` — deriving vocabulary size from a tokenizer
+
+Instead of hardcoding `vocab_size`, use `with_vocab()` to derive it from any
+HuggingFace tokenizer model ID:
+
+```python
+from open_mythos import mythos_3b
+
+cfg = mythos_3b().with_vocab("openai/gpt-oss-20b")  # → 199,998
+cfg = mythos_3b().with_vocab("Qwen/Qwen3-0.5B")     # → 151,936
+cfg = mythos_200m().with_vocab(50000)                # custom size
+```
+
+This downloads only the tokenizer configuration files (KB, not model weights).
 
 ---
 
@@ -204,8 +221,8 @@ optimizer.step()
 A looped transformer trained on `N` loops can be evaluated on `N + k` loops and often achieves higher quality on hard multi-hop problems. Pass `n_loops` at inference time:
 
 ```python
-# Trained with max_loop_iters=16 — try deeper reasoning at test time
-logits_deep = model(input_ids, n_loops=32)
+# Trained with max_loop_iters=4 — try deeper reasoning at test time
+logits_deep = model(input_ids, n_loops=8)
 ```
 
 ---
@@ -273,7 +290,7 @@ prompt = torch.tensor([[1, 450, 3118, 310, 278]])   # (1, 5)
 output = model.generate(
     prompt,
     max_new_tokens=128,
-    n_loops=16,        # deeper reasoning
+    n_loops=8,        # deeper reasoning (trained at 4, extrapolate to 8)
     temperature=0.8,
     top_k=40,
 )
@@ -288,18 +305,24 @@ The following sub-modules are assembled inside `OpenMythos`. They are not typica
 
 ### `RecurrentBlock`
 
-The heart of the architecture. A single `TransformerBlock` (with MoE FFN) is run in a loop for up to `n_loops` iterations, with the following per-iteration pipeline:
+The heart of the architecture. A stack of `recurrent_layers` distinct `TransformerBlock`s (each with its own attention weights, all sharing one MoE FFN) is run in a loop for up to `n_loops` iterations. Per-iteration pipeline:
 
 ```
-h_loop = loop_index_embedding(h, t, loop_dim)   # inject sinusoidal loop-index signal
-combined = RMSNorm(h_loop + e)                   # add frozen encoded input
-trans_out = TransformerBlock(combined, ...)       # attention + MoE FFN
-trans_out = trans_out + LoRAAdapter(trans_out, t) # depth-wise LoRA delta
-h = LTIInjection(h, e, trans_out)               # stable update: A·h + B·e + trans_out
-p = ACTHalting(h)                                # per-position halting probability
+h_loop = loop_index_embedding(h, t, loop_dim)       # inject sinusoidal loop-index signal
+combined = RMSNorm(h_loop + e)                       # add frozen encoded input
+block_out = combined
+for block in self.blocks:                            # run through all N layers
+    block_out = block(block_out, ...)
+block_out = block_out + LoRAAdapter(block_out, t)    # depth-wise LoRA delta
+h = LTIInjection(h, e, block_out)                   # stable update: A·h + B·e + block_out
+p = ACTHalting(h)                                    # per-position halting probability
 ```
 
-The loop exits early for positions whose cumulative halting probability exceeds `cfg.act_threshold`. If all positions have halted, the loop exits before `n_loops`. The final output is an ACT-weighted sum of `h` across iterations.
+Each layer has distinct MLA/GQA attention weights — different layers learn
+different attention patterns. All layers share a single `MoEFFN`; different
+layers route to different experts because the hidden state feeding the router
+differs at each layer.  This gives the model N distinct attention patterns
+per loop pass while keeping MoE parameters manageable.
 
 ### `LTIInjection`
 
