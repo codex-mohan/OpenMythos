@@ -82,7 +82,7 @@ def count_model_params(cfg: MythosConfig) -> dict:
     prelude_ffn = cfg.prelude_layers * count_dense_ffn_params(cfg)
     prelude_norms = cfg.prelude_layers * count_norm_params(cfg.dim) * 2  # attn_norm + ffn_norm
 
-    # Recurrent: per-layer attention + per-layer MoE + norms
+    # Recurrent: per-layer attention + shared MoE + norms
     rec_attn = cfg.recurrent_layers * count_attn_params(cfg)
     routed, shared, router, moe_total = count_moe_params(cfg)
     rec_moe_routed = cfg.recurrent_layers * routed
@@ -223,7 +223,7 @@ def main():
         names = list(VARIANTS)
 
     print("\n" + "=" * 80)
-    print("  PARAMETER COUNT — OpenMythos (per-layer MoE)")
+    print("  PARAMETER COUNT — OpenMythos (shared MoE)")
     print("=" * 80)
 
     for name in names:

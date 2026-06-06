@@ -565,15 +565,14 @@ class TestRecurrentBlock:
         out = block(h, e, self.freqs, n_loops=3)
         assert out.shape == (B, T, cfg.dim)
 
-    def test_per_layer_moe_has_distinct_experts(self):
+    def test_shared_moe_is_same_object_across_layers(self):
         cfg = gqa_cfg(recurrent_layers=4)
         block = RecurrentBlock(cfg)
         ffn_objects = [blk.ffn for blk in block.blocks]
-        for i in range(len(ffn_objects)):
-            for j in range(i + 1, len(ffn_objects)):
-                assert ffn_objects[i] is not ffn_objects[j], (
-                    f"Layers {i} and {j} share the same MoEFFN instance"
-                )
+        for i in range(1, len(ffn_objects)):
+            assert ffn_objects[0] is ffn_objects[i], (
+                f"Layer {i} has a different MoEFFN instance; expected shared"
+            )
 
     def test_distinct_layers_produce_different_outputs(self):
         cfg = gqa_cfg(recurrent_layers=4, max_loop_iters=1)

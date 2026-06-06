@@ -1,6 +1,6 @@
 from open_mythos.main import MythosConfig
 
-# Per-layer independent MoE — every recurrent layer has its own router and expert pool.
+# Shared MoE — all recurrent layers share the same router and expert pool.
 # Shared experts are same size as routed experts (Qwen-style, not n_per_tok× larger).
 #
 # Design ratios:

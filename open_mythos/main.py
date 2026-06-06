@@ -888,7 +888,7 @@ class RecurrentBlock(nn.Module):
     identity rather than needing a separate depth-wise adapter to infer it.
 
     Per outer-loop iteration t:
-        1. For each layer: inject loop-index + frozen e, then attention + per-layer MoE FFN
+        1. For each layer: inject loop-index + frozen e, then attention + shared MoE FFN
         2. LTIInjection: stable update h = A·h + B·e + stack_output
         3. ACTHalting: accumulate per-position halting probabilities;
            positions that have converged stop contributing
@@ -901,8 +901,12 @@ class RecurrentBlock(nn.Module):
         """
         super().__init__()
         self.cfg = cfg
+        self.shared_moe = MoEFFN(cfg)
         self.blocks = nn.ModuleList(
-            [TransformerBlock(cfg, use_moe=True) for _ in range(cfg.recurrent_layers)]
+            [
+                TransformerBlock(cfg, use_moe=True, shared_ffn=self.shared_moe)
+                for _ in range(cfg.recurrent_layers)
+            ]
         )
         self.injection = LTIInjection(cfg.dim)
         self.act = ACTHalting(cfg.dim)
