@@ -584,7 +584,7 @@ class MoEFFN(nn.Module):
                     continue
                 o = off[eid]
                 padded_x[eid, :cnt] = sorted_x[o:o + cnt]
-                padded_s[eid, :cnt, 0] = sorted_sc[o:o + cnt]
+                padded_s[eid, :cnt, 0] = sorted_sc[o:o + cnt].squeeze(-1)
                 token_map[eid, :cnt] = perm[o:o + cnt]
 
             gate_out = torch.bmm(padded_x, gate_w)       # (E, max_tok, expert_dim)
