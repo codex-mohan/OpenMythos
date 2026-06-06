@@ -52,16 +52,14 @@ for t in range(n_loops):
   (`q_down`, `q_up_nope`, `q_up_rope`, `kv_down`, `kv_up`, `wo`).  Different
   layers learn different attention patterns.
 
-- **Shared MoE across layers.**  All recurrent blocks reference the same
-  `MoEFFN` instance (passed via `shared_ffn`).  Different layers route to
-  different experts because the hidden state feeding the router differs at
-  each layer.  This keeps parameter count manageable while preserving domain
-  breadth.
+- **Per-layer MoE.**  Each recurrent block has its own `MoEFFN` instance with
+  a separate router and separate pool of experts.  This gives every layer true
+  diversity — different layers learn both different attention patterns and
+  different expert specializations, rather than competing over a shared pool.
 
 - **Effective depth = `recurrent_layers × max_loop_iters`.**  The 3B variant
-  went from 16 effective depth (1×16) to 36 (12×3) with minimal parameter
-  increase — 12× MLA attention weights (~11M extra) vs. the 2.7B MoE that is
-  shared.
+  achieves 36 effective depth (12×3).  Each layer has its own attention and
+  MoE weights, providing full parameter diversity across depth.
 
 | Variant | Old (1×N) | New (L×T) | Effective depth |
 |---|---|---|---|

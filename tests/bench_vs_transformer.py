@@ -32,7 +32,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from open_mythos import MythosConfig, OpenMythos, mythos_1b
+from open_mythos import MythosConfig, OpenMythos, mythos_3b
 from open_mythos.main import (
     RMSNorm,
     TransformerBlock,
@@ -265,7 +265,7 @@ def get_cfg(size: str) -> MythosConfig:
     if size == "small":
         return small_cfg()
     if size == "1b":
-        cfg = mythos_1b()
+        cfg = mythos_3b()
         # GQA for apples-to-apples; MLA changes KV shape semantics.
         cfg.attn_type = "gqa"
         return cfg

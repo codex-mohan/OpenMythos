@@ -25,7 +25,6 @@ from open_mythos.tokenizer import (
 from open_mythos.muon import Muon, split_muon_adamw
 from open_mythos.variants import (
     mythos_200m,
-    mythos_1b,
     mythos_1t,
     mythos_3b,
     mythos_10b,
@@ -51,7 +50,6 @@ __all__ = [
     "apply_rope",
     "loop_index_embedding",
     "mythos_200m",
-    "mythos_1b",
     "mythos_3b",
     "mythos_10b",
     "mythos_50b",

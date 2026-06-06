@@ -87,6 +87,9 @@ class MythosConfig:
     # ACT halting toggle — disable during pretraining (model hasn't learned to halt yet).
     # Enable during RL fine-tuning when per-task difficulty signal is available.
     use_act: bool = False
+    # Gradient checkpointing for the RecurrentBlock. Trades ~2x recurrent
+    # compute for ~4x lower activation memory — useful on small VRAM.
+    grad_checkpoint: bool = False
 
     def with_vocab(self, vocab_size: int | str) -> "MythosConfig":
         """
@@ -488,9 +491,11 @@ class MoEFFN(nn.Module):
     - Routed experts: n_experts small FFNs; each token activates top-K of them
       via a learned router. A per-expert bias on router logits is updated during
       training to keep load balanced across experts without distorting the loss.
-    - Shared experts: n_shared_experts larger FFNs always activated for every token,
-      absorbing common cross-domain patterns (syntax, basic reasoning) that would
-      otherwise be redundantly learned by many routed experts.
+    - Shared experts: n_shared_experts FFNs always activated for every token,
+       absorbing common cross-domain patterns (syntax, basic reasoning) that would
+       otherwise be redundantly learned by many routed experts.
+       Each shared expert uses the same expert_dim as routed experts
+       (following Qwen's design), not n_per_tok × expert_dim.
 
     Total activated parameters per token ≈ topk/n_experts of routed + all shared,
     keeping compute sparse while the total parameter count stays large.
@@ -515,45 +520,89 @@ class MoEFFN(nn.Module):
             [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
         )
         self.shared_experts = nn.ModuleList(
-            [
-                Expert(cfg.dim, cfg.expert_dim * cfg.n_experts_per_tok)
-                for _ in range(self.n_shared)
-            ]
+            [Expert(cfg.dim, cfg.expert_dim) for _ in range(self.n_shared)]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x -- input of shape (B, T, dim)
-        Returns:
-            Tensor of shape (B, T, dim); shared expert outputs are summed on top
-            of the weighted routed expert outputs
-        """
         B, T, D = x.shape
         flat = x.view(B * T, D)
+        N = B * T
+        E = self.n_experts
 
-        # Aux-loss-free load balancing (DeepSeek-V3): the bias shifts only the
-        # selection of which experts fire so underused experts are picked more,
-        # but the gating weights come from unbiased softmax scores so the bias
-        # never shows up in the gradient.
-        logits = self.router(flat)  # (B*T, n_experts), unbiased
+        logits = self.router(flat)
         scores = F.softmax(logits, dim=-1)
         _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
         topk_scores = scores.gather(-1, topk_idx)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
 
-        # routed expert dispatch (token-level scatter)
         out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
 
-        # shared experts always fire for every token
+        gate_w = torch.stack(
+            [r.gate.weight.T for r in self.routed_experts]
+        )  # (E, D, expert_dim)
+        up_w = torch.stack(
+            [r.up.weight.T for r in self.routed_experts]
+        )  # (E, D, expert_dim)
+        down_w = torch.stack(
+            [r.down.weight.T for r in self.routed_experts]
+        )  # (E, expert_dim, D)
+
+        # --- per-topk batched dispatch: groups tokens by expert, pads
+        #     to max, then runs all experts in 3 bmm calls instead of
+        #     72 individual kernel launches.
+        for i in range(self.topk):
+            eids = topk_idx[:, i]                       # (N,)
+            sc = topk_scores[:, i].unsqueeze(-1)         # (N, 1)
+
+            sorted_eids, perm = eids.sort()
+            sorted_x = flat[perm]                        # (N, D)
+            sorted_sc = sc[perm]                         # (N, 1)
+
+            _, counts = sorted_eids.unique_consecutive(return_counts=True)
+            full_counts = torch.zeros(E, device=flat.device, dtype=torch.long)
+            p = min(counts.size(0), E)
+            full_counts[:p] = counts[:p]
+
+            max_tok = int(full_counts.max().item())
+            if max_tok == 0:
+                continue
+
+            offsets = torch.cat(
+                [torch.zeros(1, device=flat.device, dtype=torch.long),
+                 full_counts.cumsum(0)]
+            )
+            fc = full_counts.cpu().tolist()
+            off = offsets.cpu().tolist()
+
+            padded_x = torch.zeros(E, max_tok, D, device=flat.device, dtype=flat.dtype)
+            padded_s = torch.zeros(E, max_tok, 1, device=flat.device, dtype=flat.dtype)
+            token_map = torch.zeros(E, max_tok, device=flat.device, dtype=torch.long)
+
+            for eid in range(E):
+                cnt = fc[eid]
+                if cnt == 0:
+                    continue
+                o = off[eid]
+                padded_x[eid, :cnt] = sorted_x[o:o + cnt]
+                padded_s[eid, :cnt, 0] = sorted_sc[o:o + cnt]
+                token_map[eid, :cnt] = perm[o:o + cnt]
+
+            gate_out = torch.bmm(padded_x, gate_w)       # (E, max_tok, expert_dim)
+            up_out = torch.bmm(padded_x, up_w)
+            act_out = F.silu(gate_out) * up_out
+            expert_out = torch.bmm(act_out, down_w)       # (E, max_tok, D)
+
+            for eid in range(E):
+                cnt = fc[eid]
+                if cnt == 0:
+                    continue
+                tok = token_map[eid, :cnt]
+                out.index_add_(
+                    0,
+                    tok,
+                    (padded_s[eid, :cnt] * expert_out[eid, :cnt]).squeeze(1),
+                )
+
         for shared in self.shared_experts:
             out = out + shared(flat)
 
@@ -827,9 +876,10 @@ class RecurrentBlock(nn.Module):
     stack is looped max_loop_iters times, giving effective depth = recurrent_layers ×
     max_loop_iters.
 
-    Each layer has its own attention weights (MLA or GQA) and all layers share a single
-    MoEFFN.  Different layers route to different experts because the hidden state feeding
-    the router differs at each layer.
+    Each layer has its own attention weights (MLA or GQA) and its own independent
+    MoEFFN with a separate router and separate expert pool.  This gives every layer
+    true diversity — different layers learn different attention patterns *and*
+    different expert specializations, rather than competing over a shared expert pool.
 
     The loop-index embedding is injected **per layer** (not once per outer loop).  This
     gives every layer a fresh, undiluted signal of which outer iteration it is on,
@@ -838,7 +888,7 @@ class RecurrentBlock(nn.Module):
     identity rather than needing a separate depth-wise adapter to infer it.
 
     Per outer-loop iteration t:
-        1. For each layer: inject loop-index + frozen e, then attention + shared MoE FFN
+        1. For each layer: inject loop-index + frozen e, then attention + per-layer MoE FFN
         2. LTIInjection: stable update h = A·h + B·e + stack_output
         3. ACTHalting: accumulate per-position halting probabilities;
            positions that have converged stop contributing
@@ -851,12 +901,8 @@ class RecurrentBlock(nn.Module):
         """
         super().__init__()
         self.cfg = cfg
-        self.shared_moe = MoEFFN(cfg)
         self.blocks = nn.ModuleList(
-            [
-                TransformerBlock(cfg, use_moe=True, shared_ffn=self.shared_moe)
-                for _ in range(cfg.recurrent_layers)
-            ]
+            [TransformerBlock(cfg, use_moe=True) for _ in range(cfg.recurrent_layers)]
         )
         self.injection = LTIInjection(cfg.dim)
         self.act = ACTHalting(cfg.dim)
@@ -897,13 +943,28 @@ class RecurrentBlock(nn.Module):
         cumulative_p = torch.zeros(B, T_len, device=h.device)
         h_out = torch.zeros_like(h) if self.cfg.use_act else h
 
+        use_ckpt = self.cfg.grad_checkpoint and self.training and torch.is_grad_enabled()
+
         for t in range(n_loops):
-            block_out = h
-            for i, block in enumerate(self.blocks):
-                block_out = loop_index_embedding(block_out, t, self.loop_dim)
-                block_out = self.norm(block_out + e)
-                cache_key = f"recurrent_loop_{t}_layer_{i}"
-                block_out = block(block_out, freqs_cis, mask, kv_cache, cache_key)
+            if use_ckpt:
+                def _stack(h, e, t=t):
+                    bo = h
+                    for i, block in enumerate(self.blocks):
+                        bo = loop_index_embedding(bo, t, self.loop_dim)
+                        bo = self.norm(bo + e)
+                        cache_key = f"recurrent_loop_{t}_layer_{i}"
+                        bo = block(bo, freqs_cis, mask, kv_cache, cache_key)
+                    return bo
+                block_out = torch.utils.checkpoint.checkpoint(
+                    _stack, h, e, use_reentrant=False
+                )
+            else:
+                block_out = h
+                for i, block in enumerate(self.blocks):
+                    block_out = loop_index_embedding(block_out, t, self.loop_dim)
+                    block_out = self.norm(block_out + e)
+                    cache_key = f"recurrent_loop_{t}_layer_{i}"
+                    block_out = block(block_out, freqs_cis, mask, kv_cache, cache_key)
 
             h = self.injection(h, e, block_out)
 
