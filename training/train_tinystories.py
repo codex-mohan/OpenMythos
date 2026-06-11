@@ -1,10 +1,10 @@
 """
 Train OpenMythos on TinyStories locally (RTX 4050 Laptop, 6GB VRAM).
 
-True ~200M variant (mythos_200m: dim=1024, 4 rec layers x 4 loops = 16 depth,
-24 experts top-4, MLA, expert_dim=384 -> ~205M total) with the following
-6GB-friendly tweaks vs. the 225M base variant:
-  - vocab: 32K -> 50K (gpt2)         (net +19M in embedding)
+~117M variant (mythos_200m base: dim=1024, 4 rec layers x 4 loops = 16 depth,
+24 experts top-4 + 1 shared, MLA, expert_dim=384, shared MoE counted once)
+with the following 6GB-friendly tweaks:
+  - vocab: gpt2 (50,257)
   - n_experts: 32 -> 24              (drop 8 routed experts)
   - max_seq_len: 4096 -> 512         (activation memory, default 512)
   - use_act: False                   (no ACT head)
@@ -50,18 +50,19 @@ from open_mythos import OpenMythos, mythos_200m, MythosTokenizer
 # ---------------------------------------------------------------------------
 
 def tinystories_cfg(seq_len: int = 512, grad_checkpoint: bool = False) -> dict:
-    """Returns a MythosConfig for the real ~200M variant on 6GB VRAM (~205M total).
+    """Returns a ~117M variant on 6GB VRAM (shared MoE counted once).
 
-    Architecture (preserved from mythos_200m):
+    Architecture (from mythos_200m base):
         dim=1024, attn=mla, rec=4x4=16, prel=3, coda=3,
-        expert_dim=384, kv_lora=128, q_lora=256
+        expert_dim=384, kv_lora=128, q_lora=256,
+        24 routed experts (top-4) + 1 shared
 
-    Memory-friendly overrides (vs. the 225M base variant with vocab=32K):
-        vocab: 32K -> 50K (gpt2)            — adds ~19M to embedding
-        n_experts: 32 -> 24                 — drop 8 routed experts
+    Memory-friendly overrides:
+        vocab: gpt2 (50,257)
+        n_experts: 32 -> 24
         max_seq_len: 4096 -> seq_len        (activations, default 512)
         use_act: False                      (no ACT head)
-        grad_checkpoint: opt-in             (3x extra compute; only useful at >1024 ctx)
+        grad_checkpoint: opt-in
         dropout: 0.0
     """
     cfg = mythos_200m().with_vocab("gpt2")

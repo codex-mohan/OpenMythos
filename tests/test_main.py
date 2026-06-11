@@ -369,10 +369,9 @@ class TestMoEFFN:
         assert "router_bias" not in param_names
 
     def test_shared_experts_always_fire(self):
-        # Zero out all routed experts; output should still be nonzero from shared
-        for exp in self.moe.routed_experts:
-            for p in exp.parameters():
-                p.data.zero_()
+        self.moe.gate_w.data.zero_()
+        self.moe.up_w.data.zero_()
+        self.moe.down_w.data.zero_()
         x = torch.randn(B, T, self.cfg.dim)
         out = self.moe(x)
         assert out.abs().sum() > 0

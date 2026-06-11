@@ -376,6 +376,7 @@ class MLAttention(nn.Module):
 
         self.wo = nn.Linear(cfg.n_heads * cfg.v_head_dim, cfg.dim, bias=False)
         self.attn_drop = nn.Dropout(cfg.dropout)
+        self.dropout_p = cfg.dropout
 
     def forward(
         self,
@@ -433,17 +434,19 @@ class MLAttention(nn.Module):
         v = kv[..., self.qk_nope_dim :]  # (B, S, H, v_dim)
         k = torch.cat([k_nope, k_rope], dim=-1)  # (B, S, H, nope+rope)
 
-        # attention
         q = q.transpose(1, 2)  # (B, H, T, q_head_dim)
         k = k.transpose(1, 2)  # (B, H, S, q_head_dim)
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
-        scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        is_causal = T == S and T > 1 and mask is not None
+        dropout_p = self.dropout_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None if is_causal else mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=self.q_head_dim**-0.5,
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -487,124 +490,95 @@ class MoEFFN(nn.Module):
     """
     Fine-grained Mixture-of-Experts FFN (DeepSeekMoE, Dai et al., 2024).
 
-    Two classes of experts:
-    - Routed experts: n_experts small FFNs; each token activates top-K of them
-      via a learned router. A per-expert bias on router logits is updated during
-      training to keep load balanced across experts without distorting the loss.
-    - Shared experts: n_shared_experts FFNs always activated for every token,
-       absorbing common cross-domain patterns (syntax, basic reasoning) that would
-       otherwise be redundantly learned by many routed experts.
-       Each shared expert uses the same expert_dim as routed experts
-       (following Qwen's design), not n_per_tok × expert_dim.
-
-    Total activated parameters per token ≈ topk/n_experts of routed + all shared,
-    keeping compute sparse while the total parameter count stays large.
+    Expert weights are stored as pre-batched parameter tensors of shape
+    (n_experts, dim, expert_dim) to avoid per-forward torch.stack overhead.
+    All topk slots are flattened into a single sort-scatter-bmm-gather cycle.
+    Shared experts are also batched via bmm.
     """
 
     def __init__(self, cfg: MythosConfig):
-        """
-        Args:
-            cfg -- MythosConfig; uses n_experts, n_shared_experts, n_experts_per_tok,
-                   dim, expert_dim
-        """
         super().__init__()
         self.n_experts = cfg.n_experts
         self.n_shared = cfg.n_shared_experts
         self.topk = cfg.n_experts_per_tok
 
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
-        # load-balancing bias adjusted externally during training; not a gradient param
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
 
-        self.routed_experts = nn.ModuleList(
-            [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
-        )
-        self.shared_experts = nn.ModuleList(
-            [Expert(cfg.dim, cfg.expert_dim) for _ in range(self.n_shared)]
-        )
+        D, E_dim = cfg.dim, cfg.expert_dim
+        self.gate_w = nn.Parameter(torch.empty(cfg.n_experts, D, E_dim))
+        self.up_w = nn.Parameter(torch.empty(cfg.n_experts, D, E_dim))
+        self.down_w = nn.Parameter(torch.empty(cfg.n_experts, E_dim, D))
+
+        if self.n_shared > 0:
+            self.shared_gate_w = nn.Parameter(torch.empty(self.n_shared, D, E_dim))
+            self.shared_up_w = nn.Parameter(torch.empty(self.n_shared, D, E_dim))
+            self.shared_down_w = nn.Parameter(torch.empty(self.n_shared, E_dim, D))
+
+        self._init_expert_weights()
+
+    def _init_expert_weights(self):
+        for w in (self.gate_w, self.up_w, self.down_w):
+            nn.init.normal_(w, std=0.02)
+        if self.n_shared > 0:
+            for w in (self.shared_gate_w, self.shared_up_w, self.shared_down_w):
+                nn.init.normal_(w, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         flat = x.view(B * T, D)
         N = B * T
         E = self.n_experts
+        K = self.topk
 
         logits = self.router(flat)
         scores = F.softmax(logits, dim=-1)
-        _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
+        _, topk_idx = (logits + self.router_bias).topk(K, dim=-1)
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
 
         out = torch.zeros_like(flat)
 
-        gate_w = torch.stack(
-            [r.gate.weight.T for r in self.routed_experts]
-        )  # (E, D, expert_dim)
-        up_w = torch.stack(
-            [r.up.weight.T for r in self.routed_experts]
-        )  # (E, D, expert_dim)
-        down_w = torch.stack(
-            [r.down.weight.T for r in self.routed_experts]
-        )  # (E, expert_dim, D)
+        all_eids = topk_idx.reshape(-1)
+        all_scores = topk_scores.reshape(-1, 1)
+        all_x = flat.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)
+        all_orig = torch.arange(N, device=flat.device).unsqueeze(1).expand(-1, K).reshape(-1)
 
-        # --- per-topk batched dispatch: groups tokens by expert, pads
-        #     to max, then runs all experts in 3 bmm calls instead of
-        #     72 individual kernel launches.
-        for i in range(self.topk):
-            eids = topk_idx[:, i]                       # (N,)
-            sc = topk_scores[:, i].unsqueeze(-1)         # (N, 1)
+        sorted_eids, perm = all_eids.sort()
+        sorted_x = all_x[perm]
+        sorted_sc = all_scores[perm]
+        sorted_orig = all_orig[perm]
 
-            sorted_eids, perm = eids.sort()
-            sorted_x = flat[perm]                        # (N, D)
-            sorted_sc = sc[perm]                         # (N, 1)
+        NK = N * K
+        full_counts = torch.zeros(E, device=flat.device, dtype=torch.long)
+        full_counts.scatter_add_(0, sorted_eids, torch.ones(NK, device=flat.device, dtype=torch.long))
 
-            _, counts = sorted_eids.unique_consecutive(return_counts=True)
-            full_counts = torch.zeros(E, device=flat.device, dtype=torch.long)
-            p = min(counts.size(0), E)
-            full_counts[:p] = counts[:p]
+        max_tok = int(full_counts.max().item())
+        if max_tok > 0:
+            offsets = torch.zeros(E + 1, device=flat.device, dtype=torch.long)
+            offsets[1:] = full_counts.cumsum(0)
 
-            max_tok = int(full_counts.max().item())
-            if max_tok == 0:
-                continue
-
-            offsets = torch.cat(
-                [torch.zeros(1, device=flat.device, dtype=torch.long),
-                 full_counts.cumsum(0)]
-            )
-            fc = full_counts.cpu().tolist()
-            off = offsets.cpu().tolist()
+            local_pos = (torch.arange(NK, device=flat.device) - offsets[sorted_eids]).long()
 
             padded_x = torch.zeros(E, max_tok, D, device=flat.device, dtype=flat.dtype)
             padded_s = torch.zeros(E, max_tok, 1, device=flat.device, dtype=flat.dtype)
-            token_map = torch.zeros(E, max_tok, device=flat.device, dtype=torch.long)
+            padded_x[sorted_eids, local_pos] = sorted_x
+            padded_s[sorted_eids, local_pos] = sorted_sc
 
-            for eid in range(E):
-                cnt = fc[eid]
-                if cnt == 0:
-                    continue
-                o = off[eid]
-                padded_x[eid, :cnt] = sorted_x[o:o + cnt]
-                padded_s[eid, :cnt, 0] = sorted_sc[o:o + cnt].squeeze(-1)
-                token_map[eid, :cnt] = perm[o:o + cnt]
+            gate_out = torch.bmm(padded_x, self.gate_w)
+            up_out = torch.bmm(padded_x, self.up_w)
+            expert_out = torch.bmm(F.silu(gate_out) * up_out, self.down_w)
 
-            gate_out = torch.bmm(padded_x, gate_w)       # (E, max_tok, expert_dim)
-            up_out = torch.bmm(padded_x, up_w)
-            act_out = F.silu(gate_out) * up_out
-            expert_out = torch.bmm(act_out, down_w)       # (E, max_tok, D)
+            weighted = padded_s * expert_out
+            gathered = weighted[sorted_eids, local_pos]
+            out.index_add_(0, sorted_orig, gathered)
 
-            for eid in range(E):
-                cnt = fc[eid]
-                if cnt == 0:
-                    continue
-                tok = token_map[eid, :cnt]
-                out.index_add_(
-                    0,
-                    tok,
-                    (padded_s[eid, :cnt] * expert_out[eid, :cnt]).squeeze(1),
-                )
-
-        for shared in self.shared_experts:
-            out = out + shared(flat)
+        if self.n_shared > 0:
+            flat_exp = flat.unsqueeze(0).expand(self.n_shared, -1, -1)
+            sg = torch.bmm(flat_exp, self.shared_gate_w)
+            su = torch.bmm(flat_exp, self.shared_up_w)
+            shared_out = torch.bmm(F.silu(sg) * su, self.shared_down_w)
+            out = out + shared_out.sum(0)
 
         return out.view(B, T, D)
 
@@ -911,9 +885,18 @@ class RecurrentBlock(nn.Module):
         self.injection = LTIInjection(cfg.dim)
         self.act = ACTHalting(cfg.dim)
         self.norm = RMSNorm(cfg.dim)
-        self.loop_dim = (
-            cfg.dim // 8
-        )  # fraction of channels receiving loop-index embedding
+        self.loop_dim = cfg.dim // 8
+        max_t = max(cfg.max_loop_iters * 4, 32)
+        loop_dim = self.loop_dim
+        freqs = 1.0 / (10000.0 ** (torch.arange(0, loop_dim, 2).float() / loop_dim))
+        embs = []
+        for t in range(max_t):
+            angles = t * freqs
+            emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim]
+            emb_full = torch.zeros(cfg.dim)
+            emb_full[:loop_dim] = emb
+            embs.append(emb_full)
+        self.register_buffer("loop_embs", torch.stack(embs))
 
     def forward(
         self,
@@ -950,11 +933,13 @@ class RecurrentBlock(nn.Module):
         use_ckpt = self.cfg.grad_checkpoint and self.training and torch.is_grad_enabled()
 
         for t in range(n_loops):
+            t_emb = self.loop_embs[min(t, self.loop_embs.shape[0] - 1)]
+
             if use_ckpt:
-                def _stack(h, e, t=t):
+                def _stack(h, e, t_emb=t_emb, t=t):
                     bo = h
                     for i, block in enumerate(self.blocks):
-                        bo = loop_index_embedding(bo, t, self.loop_dim)
+                        bo = bo + t_emb
                         bo = self.norm(bo + e)
                         cache_key = f"recurrent_loop_{t}_layer_{i}"
                         bo = block(bo, freqs_cis, mask, kv_cache, cache_key)
@@ -965,7 +950,7 @@ class RecurrentBlock(nn.Module):
             else:
                 block_out = h
                 for i, block in enumerate(self.blocks):
-                    block_out = loop_index_embedding(block_out, t, self.loop_dim)
+                    block_out = block_out + t_emb
                     block_out = self.norm(block_out + e)
                     cache_key = f"recurrent_loop_{t}_layer_{i}"
                     block_out = block(block_out, freqs_cis, mask, kv_cache, cache_key)
@@ -1055,8 +1040,11 @@ class OpenMythos(nn.Module):
         )
 
         self.norm = RMSNorm(cfg.dim)
-        self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        self.head = nn.Linear(cfg.vocab_size, cfg.dim, bias=False)
         self.head.weight = self.embed.weight  # weight tying
+
+        causal = torch.full((1, 1, cfg.max_seq_len, cfg.max_seq_len), float("-inf"))
+        self.register_buffer("_causal_mask_buf", torch.triu(causal, diagonal=1))
 
         self._init_weights()
 
@@ -1123,7 +1111,7 @@ class OpenMythos(nn.Module):
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
         )[start_pos : start_pos + T]
-        mask = self._causal_mask(T, device, x.dtype) if T > 1 else None
+        mask = self._causal_mask_buf[:, :, :T, :T].to(dtype=x.dtype) if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
